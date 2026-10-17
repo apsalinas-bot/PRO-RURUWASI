@@ -55,6 +55,9 @@ body{overflow-x:hidden}
 .who button{font-size:12px;font-weight:700;padding:5px 10px;border-radius:99px;background:rgba(255,255,255,.15)}
 .saved{font-size:12px;opacity:0;transition:.3s;color:var(--maize-2);white-space:nowrap}
 .saved.on{opacity:1}
+.cloud{font-size:12px;font-weight:700;padding:5px 10px;border-radius:99px;white-space:nowrap;background:rgba(255,255,255,.1)}
+.cloud.ok{color:#8EE6B4}.cloud.retry{color:#FFE08A}.cloud.off{color:#FFC48A}.cloud.sync{color:#fff;opacity:.8}
+@media (max-width:520px){.cloud{font-size:11px;padding:4px 8px}.cloud:not([style*='none'])~.who{max-width:52%}.hd .brand:has(~ .sp ~ .saved ~ .cloud:not([style*='none'])){display:none}}
 .steps{display:flex;gap:6px;overflow-x:auto;padding:0 16px 12px;max-width:960px;margin:0 auto;scrollbar-width:none}
 .steps::-webkit-scrollbar{display:none}
 .stp{flex:none;display:flex;align-items:center;gap:7px;font-size:13.5px;font-weight:700;padding:7px 12px 7px 7px;border-radius:99px;background:rgba(255,255,255,.08);color:rgba(255,255,255,.65);transition:.25s}
@@ -243,6 +246,7 @@ nav.bottom #bSaveNow.done{background:var(--green-2)}
     <div class="brand"><b>RURUWASI</b><span>Mi hoja de trabajo · Sesión 8</span></div>
     <div class="sp"></div>
     <span class="saved" id="saved">✓ Guardado</span>
+    <span class="cloud" id="cloud" style="display:none"></span>
     <div class="who"><span id="whoName"></span><button id="logout">Salir</button></div>
   </div>
   <div class="steps" id="steps"></div>
@@ -262,7 +266,7 @@ nav.bottom #bSaveNow.done{background:var(--green-2)}
       <input id="dniIn" class="dni" inputmode="numeric" autocomplete="off" maxlength="8" placeholder="••••••••">
       <div class="err" id="dniErr"></div>
       <button class="btn g block" id="enter" style="margin-top:6px">Entrar</button>
-      <p class="small" style="text-align:center;margin-top:12px">Tu avance se guarda en este celular o computadora. Si cambias de equipo, usa “Guardar copia” al final.</p>
+      <p class="small" style="text-align:center;margin-top:12px" id="loginHint">Tu avance se guarda en este celular o computadora. Si cambias de equipo, usa “Guardar copia” al final.</p>
       <div class="recent" id="recent"></div>
       </div>
       <div id="resume" style="display:none"></div>
@@ -381,6 +385,75 @@ nav.bottom #bSaveNow.done{background:var(--green-2)}
 const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const KEY='ruruwasi-s8:';
+/* =====================================================================
+   NUBE · JSONBin (opcional)
+   Pega tu llave en "llave". Si queda vacía, la app guarda solo en el celular.
+   tipoLlave: 'X-Access-Key' (recomendado: llave con permisos Bins Read + Update)
+              o 'X-Master-Key'.
+   ===================================================================== */
+const NUBE = {
+  bin: '6ad37a42ffd5d160537392af',
+  llave: '$2a$10$VVamFF0tCNmKSO2PXIniTO6Fon3nSJ.E8t9YcevqFPurueX/mDOlm',
+  tipoLlave: 'X-Master-Key'
+};
+const API='https://api.jsonbin.io/v3/b/';
+const cloudOn=()=>!!(NUBE.bin && NUBE.llave && NUBE.llave.length>10);
+async function dniId(d){
+  const txt='ruruwasi-s8|'+d;
+  try{ const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(txt)); return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('').slice(0,24); }
+  catch(e){ let h=5381; for(const c of txt) h=((h<<5)+h+c.charCodeAt(0))>>>0; return 'h'+h.toString(16); }
+}
+function withTimeout(p,ms){ return Promise.race([p,new Promise((_,r)=>setTimeout(()=>r(new Error('timeout')),ms))]); }
+async function cloudRead(){
+  const r=await withTimeout(fetch(API+NUBE.bin+'/latest',{headers:{[NUBE.tipoLlave]:NUBE.llave,'X-Bin-Meta':'false'},cache:'no-store'}),8000);
+  if(!r.ok) throw new Error('read '+r.status);
+  let j=await r.json(); if(j && j.record && j.metadata) j=j.record;
+  if(!j || typeof j!=='object' || Array.isArray(j)) j={};
+  if(!j.participantes || typeof j.participantes!=='object') j.participantes={};
+  return j;
+}
+async function cloudFind(dni){ if(!cloudOn()) return null; try{ const j=await cloudRead(); const rec=j.participantes[await dniId(dni)]; return rec?Object.assign(blank(dni),rec,{dni}):null; }catch(e){ return null; } }
+let syncChain=Promise.resolve(), lastSync={ok:null,at:null}, syncedUpd='', retries=0, retryT=null, lastCheck=0, lastPend=Date.now();
+function cloudSync(why){
+  if(!cloudOn()||!S) return Promise.resolve(false);
+  const snap=JSON.parse(JSON.stringify(S));
+  syncChain=syncChain.then(async()=>{
+    try{
+      setCloud('sync');
+      const j=await cloudRead();
+      const id=await dniId(snap.dni);
+      const rec=Object.assign({},snap); delete rec.dni; rec.dniFin=snap.dni.slice(-3); rec.motivo=why||'';
+      const old=j.participantes[id];
+      if(old && old.updated && rec.updated && old.updated>rec.updated) { setCloud('ok'); return true; }   // ya hay algo más nuevo en la nube
+      let base=j;
+      for(let intento=0; intento<6; intento++){
+        if(intento) await new Promise(res=>setTimeout(res,400+Math.random()*1200*intento));
+        base.participantes[id]=rec; base.sesion='Ruruwasi · Sesión 8'; base.actualizado=new Date().toISOString();
+        const body=JSON.stringify(base);
+        const r=await withTimeout(fetch(API+NUBE.bin,{method:'PUT',headers:{'Content-Type':'application/json',[NUBE.tipoLlave]:NUBE.llave},body,keepalive:body.length<60000}),10000);
+        if(!r.ok) throw new Error('put '+r.status);
+        // Confirmar: si otra persona guardó al mismo tiempo y nos pisó, volvemos a escribir sobre lo más nuevo
+        await new Promise(res=>setTimeout(res,350+Math.random()*500));
+        const chk=await cloudRead(); const mine=chk.participantes[id];
+        if(mine && mine.updated===rec.updated){ lastSync={ok:true,at:new Date()}; syncedUpd=rec.updated; retries=0; setCloud('ok'); lastCheck=Date.now()-180000+(7000+Math.random()*5000); return true; }
+        base=chk;
+      }
+      throw new Error('no confirmado');
+    }catch(e){ lastSync={ok:false,at:new Date()};
+      const online=navigator.onLine!==false; setCloud(online?'retry':'off');
+      if(online && retries<8){ retries++; clearTimeout(retryT); retryT=setTimeout(()=>cloudSync('reintento'),2500+Math.random()*5000); }
+      return false; }
+  });
+  return syncChain;
+}
+function setCloud(st){ const e=$('#cloud'); if(!e) return; if(!cloudOn()){ e.style.display='none'; return; } e.style.display='';
+  e.className='cloud '+st; e.textContent= st==='sync'?'☁️ Guardando…': st==='ok'?'☁️ En la nube': st==='retry'?'☁️ Reintentando…':'📱 Solo en el celular'; }
+/* Vigilancia: si hay cambios sin subir, los sube; cada 3 min confirma que su hoja sigue en la nube */
+setInterval(async()=>{
+  if(!S||!cloudOn()) return;
+  if((S.updated||'')>syncedUpd && Date.now()-lastPend>60000){ lastPend=Date.now(); cloudSync('pendiente'); return; }
+  if(Date.now()-lastCheck>180000){ lastCheck=Date.now(); try{ const j=await cloudRead(); const m=j.participantes[await dniId(S.dni)]; if(!m||(m.updated||'')<(S.updated||'')) cloudSync('restaurar'); }catch(e){} }
+},4000);
 const store={
   get(k){ try{ const v=localStorage.getItem(KEY+k); return v?JSON.parse(v):null; }catch(e){ return null; } },
   set(k,v){ try{ localStorage.setItem(KEY+k,JSON.stringify(v)); return true; }catch(e){ return false; } }
@@ -427,28 +500,32 @@ function countOf(x){ const f=Object.values(x.foda||{}).reduce((a,l)=>a+l.length,
 function snapshot(why){ if(!S) return; const h=store.get('h:'+S.dni)||[]; const last=h[h.length-1]; const data=JSON.stringify(S); const core=x=>JSON.stringify(Object.assign({},x,{step:0,updated:0}));
   if(last && core(last.d)===core(S)) return; h.push({at:new Date().toISOString(),why,d:JSON.parse(data)}); while(h.length>8) h.shift(); store.set('h:'+S.dni,h); }
 let pendingDni=null;
-function login(){
+async function login(){
   const d=$('#dniIn').value.trim();
   if(!/^\d{8}$/.test(d)){ $('#dniErr').textContent='El DNI tiene 8 números.'; return; }
-  const prev=store.get('u:'+d);
+  const local=store.get('u:'+d);
+  let cloud=null;
+  if(cloudOn()){ const b=$('#enter'); b.disabled=true; b.textContent='Buscando tu hoja…'; cloud=await cloudFind(d); b.disabled=false; b.textContent='Entrar'; }
   $('#dniIn').value='';
-  if(prev){ pendingDni=d; showResume(prev); return; }
+  let prev=local, src='en este equipo';
+  if(cloud && (!local || (cloud.updated||'')>(local.updated||''))){ prev=cloud; src='en la nube'; }
+  if(prev){ pendingDni=d; showResume(prev,src); return; }
   enter(blank(d));
 }
 function enter(data){
   S=data; $('#resume').style.display='none'; $('#loginForm').style.display='';
   S.metas.forEach(m=>m.acc.forEach(a=>{ if(!a.r && S.nombre) a.r=firstName(); }));
   $('#hdr').style.display=''; $('#nav').style.display='';
-  fillBinds(); step=Math.min(S.step||0, STEPS.length-1); go(step); save();
+  fillBinds(); step=Math.min(S.step||0, STEPS.length-1); go(step); save(); setCloud(lastSync.ok===false?'off':'ok'); cloudSync('ingreso');
   toast(S.nombre?`¡Hola de nuevo, ${firstName()}! Trajimos tu última respuesta.`:'¡Bienvenida!');
 }
-function showResume(prev){
+function showResume(prev,src){
   $('#loginForm').style.display='none'; const r=$('#resume'); r.style.display='';
   const h=(store.get('h:'+prev.dni)||[]).slice().reverse();
   r.innerHTML=`<div class="card" style="text-align:center">
      <div class="av" style="width:64px;height:64px;font-size:28px;margin:0 auto">${esc((prev.nombre||'?')[0].toUpperCase())}</div>
      <h2 style="font-family:var(--f-disp);font-size:26px;margin-top:10px">Hola${prev.nombre?', '+esc(prev.nombre.split(' ')[0]):''} 👋</h2>
-     <p class="lead" style="margin:6px auto 0">Encontramos tu hoja. Tu última respuesta se guardó el <b>${fmtWhen(prev.updated)}</b></p>
+     <p class="lead" style="margin:6px auto 0">Encontramos tu hoja ${src||''}. Tu última respuesta se guardó el <b>${fmtWhen(prev.updated)}</b></p>
      <p class="small" style="margin-top:6px">${countOf(prev)}</p>
      <button class="btn g block" id="rLast" style="margin-top:16px">📥 Traer mi última respuesta</button>
      ${h.length?`<button class="btn ghost block" id="rHist" style="margin-top:10px">🕑 Ver respuestas anteriores (${h.length})</button><div id="rList" style="display:none;text-align:left;margin-top:10px"></div>`:''}
@@ -462,7 +539,7 @@ function showResume(prev){
   $('#rBack').onclick=()=>{ pendingDni=null; r.style.display='none'; $('#loginForm').style.display=''; };
 }
 const snapshotSoon=w=>setTimeout(()=>snapshot(w),300);
-$('#logout').onclick=()=>{ save(); snapshot('al salir'); S=null; $('#hdr').style.display='none'; $('#nav').style.display='none'; $$('.view').forEach(v=>v.classList.remove('on')); $('#v-login').classList.add('on'); renderRecent(); scrollTo(0,0); };
+$('#logout').onclick=()=>{ save(); snapshot('al salir'); cloudSync('salir'); S=null; $('#hdr').style.display='none'; $('#nav').style.display='none'; $$('.view').forEach(v=>v.classList.remove('on')); $('#v-login').classList.add('on'); renderRecent(); scrollTo(0,0); };
 
 /* ---------------- Navegación ---------------- */
 $('#steps').innerHTML=STEPS.map((s,i)=>`<button class="stp" data-s="${i}"><i>${i+1}</i>${s[1]}</button>`).join('');
@@ -470,7 +547,7 @@ $$('#steps .stp').forEach(b=>b.onclick=()=>go(+b.dataset.s));
 $('#prev').onclick=()=>go(step-1);
 $('#next').onclick=()=>{ if(step===0 && !S.nombre.trim()){ toast('Escribe tu nombre para continuar'); $('#fNombre').focus(); return; } go(step+1); };
 function go(n){
-  if(n<0||n>=STEPS.length) return; if(S && n!==step) snapshot('paso '+(step+1)); step=n;
+  if(n<0||n>=STEPS.length) return; if(S && n!==step){ snapshot('paso '+(step+1)); setTimeout(()=>cloudSync('paso '+(n+1)),400); } step=n;
   $$('.view').forEach(v=>v.classList.remove('on')); $('#v-'+STEPS[n][0]).classList.add('on');
   $$('#steps .stp').forEach((b,i)=>{ b.classList.toggle('now',i===n); b.classList.toggle('done',i<n); });
   $('#steps .stp.now')?.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'});
@@ -584,7 +661,7 @@ function summaryHTML(){
 function renderSum(){
   $('#sum').innerHTML=`<div class="card" style="display:flex;gap:12px;align-items:center"><span class="av" style="width:52px;height:52px;font-size:22px">${esc((S.nombre||'?')[0].toUpperCase())}</span><div><b style="font-size:19px">${esc(S.nombre)||'Sin nombre'}</b><div class="small">${esc(S.negocio)}${S.rubro?' · '+esc(S.rubro):''}</div></div></div>`+summaryHTML();
 }
-$('#bPdf').onclick=()=>{
+$('#bPdf').onclick=()=>{ cloudSync('pdf');
   $('#print').innerHTML=`<div class="ph"><div><small>RURUWASI · Sesión 8 · Diagnóstico y plan estratégico</small><h1>${esc(S.nombre)} · ${esc(S.negocio)}</h1></div><small>Mi hoja de trabajo · ${new Date().toLocaleDateString('es-PE')}</small></div>${summaryHTML()}`;
   setTimeout(()=>window.print(),60);
 };
@@ -596,7 +673,7 @@ function waText(){
   L.push('',`*MI ACCIÓN DEL LUNES:* ${S.lunes||'—'}`);
   return L.join('\n');
 }
-$('#bWa').onclick=()=>{ window.open('https://wa.me/?text='+encodeURIComponent(waText()),'_blank'); };
+$('#bWa').onclick=()=>{ cloudSync('whatsapp'); window.open('https://wa.me/?text='+encodeURIComponent(waText()),'_blank'); };
 $('#bSave').onclick=()=>{
   const blob=new Blob([JSON.stringify(S,null,1)],{type:'application/json'});
   const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
@@ -612,9 +689,14 @@ $('#fileIn').onchange=e=>{
   r.readAsText(f); e.target.value='';
 };
 addEventListener('beforeunload',()=>{ if(S){ save(); snapshot('al cerrar'); } });
-document.addEventListener('visibilitychange',()=>{ if(document.hidden && S){ save(); snapshot('al salir de la app'); } });
-$('#bSaveNow').onclick=()=>{ save(); snapshot('guardado'); const b=$('#bSaveNow'); b.textContent='✓ Guardado'; b.classList.add('done'); toast('Tu avance quedó guardado en este equipo'); setTimeout(()=>{ b.textContent='💾 Guardar'; b.classList.remove('done'); },1800); };
+document.addEventListener('visibilitychange',()=>{ if(document.hidden && S){ save(); snapshot('al salir de la app'); cloudSync('segundo plano'); } });
+$('#bSaveNow').onclick=async()=>{ save(); snapshot('guardado'); const b=$('#bSaveNow'); b.textContent='✓ Guardado'; b.classList.add('done');
+  if(cloudOn()){ toast('Guardando…'); const ok=await cloudSync('botón guardar'); toast(ok?'☁️ Guardado en este celular y en la nube': navigator.onLine===false?'📱 Guardado en este celular. Sin internet: se subirá a la nube después.':'📱 Guardado en este celular. La nube está ocupada: lo subo en unos segundos.'); }
+  else toast('Tu avance quedó guardado en este equipo');
+  setTimeout(()=>{ b.textContent='💾 Guardar'; b.classList.remove('done'); },1800); };
 $('#bPdfNav').onclick=()=>$('#bPdf').click();
+addEventListener('online',()=>{ if(S) cloudSync('reconexión'); });
+if(cloudOn()) $('#loginHint').textContent='Tu avance se guarda en este celular y en la nube: puedes seguir desde otro equipo entrando con tu DNI.';
 renderRecent();
 </script>
 </body>
